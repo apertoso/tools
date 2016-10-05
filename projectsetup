@@ -1,0 +1,253 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# PYTHON_ARGCOMPLETE_OK
+import argparse
+import datetime
+import itertools
+import logging
+import os
+import warnings
+
+import argcomplete
+import sh
+from tzlocal import get_localzone
+
+"""
+    Setup a development project structure
+"""
+
+_logger = logging.getLogger(__name__)
+
+if __name__ == '__main__' and __package__ is None:
+    from os import sys, path
+
+    sys.path.append(
+        path.dirname(
+            path.dirname(
+                path.abspath(__file__)
+            )
+        )
+    )
+    from packages import instancedata, projectsetup
+
+
+def main():
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            import caffeine
+            caffeine.on(display=False)
+    except (ImportError, OSError):
+        pass
+
+    parser = argparse.ArgumentParser(
+        parents=instancedata.get_parser()
+    )
+    parser.add_argument(
+        '--git-bare-dir',
+        default='~/Workspace/git-repos',
+        help="Path where bare git repo's are stored.  Default: "
+             "~/Workspace/git-repos "
+    )
+    parser.add_argument(
+        '--update-repo',
+        action='store_true',
+        help="Fetch all git repo's from the remote git server"
+    )
+    parser.add_argument(
+        '--update-workdir',
+        action='store_true',
+        help="Don't checkout git workdirs"
+    )
+    parser.add_argument(
+        '--build',
+        action='store_true',
+        help="Run docker build for this project"
+    )
+    parser.add_argument(
+        '--push',
+        action='store_true',
+        help="Push docker build to registry"
+    )
+    parser.add_argument(
+        '--addons-dir',
+        help="Use this path as extra-addons-dir instead of "
+             "<workdir>/addons-extra"
+    )
+    parser.add_argument(
+        '--repos-dir',
+        help="Use this path as repository directory instead of "
+             "<workdir>/repos"
+    )
+    parser.add_argument(
+        '-r', '--reload',
+        action='store_true',
+        help="Reload instance data form saved url")
+    parser.add_argument(
+        '--offline',
+        action='store_true',
+        help="Run in offline mode")
+
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+
+    if not args.offline:
+        try:
+            print "Checking for updates"
+            if 'Updating' in (sh.git('-C',
+                                     os.path.split(os.path.realpath(__file__))[
+                                         0],
+                                     'pull')):
+                print "Script updated, restarting..."
+                os.execv(__file__, sys.argv)
+        except:
+            print "Could not check for updates"
+
+    # You must initialize logging, otherwise you'll not see debug output.
+    if args.debug:
+        logging.basicConfig()
+        logging.getLogger().setLevel(logging.DEBUG)
+        requests_log = logging.getLogger("requests.packages.urllib3")
+        requests_log.setLevel(logging.DEBUG)
+        requests_log.propagate = True
+        sh_log = logging.getLogger("sh")
+        sh_log.setLevel(logging.WARN)
+        sh_log.propagate = True
+
+    instance_data = instancedata.InstanceData(
+        workdir=args.work_dir,
+        init_url=args.init,
+    )
+    workdir_path = instance_data.get_work_dir()
+
+    if args.url:
+        instance_data.fetch(args.url)
+        instance_data.save_to_data_file()
+    else:
+        instance_data.load_from_data_file()
+    if args.reload:
+        instance_data.refresh_from_saved_url()
+        instance_data.save_to_data_file()
+
+    devel_mode = instance_data.get_data('state') == 'devel'
+    test_mode = instance_data.get_data('state') == 'test'
+    prod_mode = instance_data.get_data('state') == 'prod'
+
+    #####################
+    # TEST / PROD SETUP #
+    #####################
+    if ((test_mode or prod_mode) and not args.build):
+        print "Running init in %s mode, not setting up development env." % \
+              instance_data.get_data('state')
+        print "Pulling current version of docker image"
+        projectsetup.pull_docker_image(
+            instance_data.get_docker_image(),
+            instance_data.get_docker_image_tag())
+        return
+    # else
+
+    #############################
+    # PUSH in DEV mode FAILSAFE #
+    #############################
+    if devel_mode and args.push:
+        print "Push option invalid in development mode, stopping!"
+        return
+
+    #################################
+    # BUILD / DEV ENVIRONMENT SETUP #
+    #################################
+
+    print "Checking project folders"
+    if args.addons_dir:
+        addons_path = os.path.abspath(os.path.expanduser(args.addons_dir))
+    else:
+        addons_path = os.path.join(workdir_path, 'addons-extra')
+    if args.repos_dir:
+        reposdir_path = os.path.abspath(
+            os.path.expanduser(args.args.repos_dir))
+    else:
+        reposdir_path = os.path.join(workdir_path, 'repos')
+
+    bare_git_path = os.path.expanduser(args.git_bare_dir)
+    projectsetup.check_folders(workdir_path, addons_path,
+                               reposdir_path, bare_git_path)
+
+    print "Updating Repositories"
+    projectsetup.fetch_repos(
+        instance_data.branches, bare_git_path, update_repo=args.update_repo)
+    if devel_mode:
+        projectsetup.fetch_odoo(
+            instance_data, bare_git_path, update_repo=args.update_repo)
+
+    print "Updating worktrees"
+    projectsetup.checkout_workdirs(
+        instance_data.branches, bare_git_path, reposdir_path,
+        update_workdir=args.update_workdir)
+    if devel_mode:
+        projectsetup.checkout_odoo(
+            instance_data, bare_git_path, workdir_path,
+            update_workdir=args.update_workdir)
+
+    if devel_mode:
+        print "Linking addons from repositories to addons directory"
+        projectsetup.link_addons(
+            instance_data.branches, addons_path, reposdir_path)
+    else:
+        print "Copying addons from repositories to addons directory"
+        projectsetup.copy_addons(
+            instance_data.branches, addons_path, reposdir_path)
+        print "Cleaning up repository workdirs"
+        sh.rm('-rf', reposdir_path)
+
+    print "Checking module dependencies"
+    module_list = list(itertools.chain.from_iterable(
+        [b.get('enabled_modules') for b in
+         instance_data.branches]))
+
+    pip_deps_set = set()
+    apt_deps_set = set()
+    for module in module_list:
+        module_path = os.path.join(addons_path, module)
+        pip_deps, apt_deps = projectsetup.parse_openerp_module(module_path)
+        pip_deps_set |= set(pip_deps)
+        apt_deps_set |= set(apt_deps)
+
+    # check deps in instance_data
+    missing_pip_deps = list(
+        pip_deps_set - set(instance_data.get_data('pip_module_ids', [])))
+    missing_apt_deps = list(
+        apt_deps_set - set(instance_data.get_data('apt_package_ids', [])))
+
+    if len(missing_pip_deps) or len(missing_apt_deps):
+        print "WARNING: missing dependencies in instance data !!"
+        print "Missing pip deps: {}".format(missing_pip_deps)
+        print "Missing apt deps: {}".format(missing_apt_deps)
+        print "Please fix instance data and run again with refresh"
+
+    print "Writing dockerfile"
+    projectsetup.write_docker_file(workdir_path, instance_data, devel_mode)
+
+    timestamp = datetime.datetime.now(get_localzone()).strftime(
+        '%Y%m%d-%H%M%S-%Z')
+
+    if args.build:
+        print "Building Docker image"
+        projectsetup.build_docker_image(
+            workdir_path, instance_data.get_docker_image(),
+            timestamp, pull=True)
+
+    if args.push:
+        print "Pushing Docker image to registry"
+        projectsetup.tag_docker_image(
+            instance_data.get_docker_image(), timestamp,
+            instance_data.get_docker_image_tag())
+        projectsetup.push_docker_image(
+            instance_data.get_docker_image(), timestamp)
+        instance_data.save_key_to_data_file('ts_tag', timestamp)
+        projectsetup.push_docker_image(
+            instance_data.get_docker_image(),
+            instance_data.get_docker_image_tag())
+
+
+if __name__ == '__main__':
+    main()

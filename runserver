@@ -1,0 +1,293 @@
+#!/usr/bin/env python
+#  -*- coding: utf-8 -*-
+# PYTHON_ARGCOMPLETE_OK
+
+import argparse
+import glob
+import logging
+import os
+import subprocess
+from pprint import pprint
+
+import argcomplete
+import sh
+
+if __name__ == '__main__' and __package__ is None:
+    from os import sys, path
+
+    sys.path.append(
+        path.dirname(
+            path.dirname(
+                path.abspath(__file__)
+            )
+        )
+    )
+    from packages import instancedata, dbrestore, projectsetup
+
+_logger = logging.getLogger(__name__)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        parents=instancedata.get_parser()
+    )
+    group_odoo_run = parser.add_argument_group('odoo server options')
+
+    addons_dir = 'addons-extra'
+
+    def module_completer(prefix, **kwargs):
+        glob_list = glob.glob('{}/{}*'.format(addons_dir, prefix or ''))
+        return [s.replace(addons_dir + '/', '') for s in glob_list]
+
+    group_odoo_run.add_argument(
+        '--database', '-d',
+        help="Specify the odoo database to run", )
+    group_odoo_run.add_argument(
+        '--auto-reload',
+        action='store_true',
+        help="Enable odoo '--dev' auto-reload function, only valid "
+             "with developer instances")
+    group_odoo_run.add_argument(
+        '--test-enable',
+        action="store_true",
+        help="Enable odoo integration tests.")
+    group_odoo_run.add_argument(
+        '--update', '-u',
+        help="Update these modules").completer = module_completer
+
+    group_odoo_env = parser.add_argument_group('odoo environment options')
+
+    group_odoo_env.add_argument(
+        '--force', '-f',
+        action='store_true',
+        help="Run even if odoo modules need update", )
+    group_odoo_env.add_argument(
+        '--auto-update',
+        action='store_true',
+        help="Automagically update odoo modules", )
+    group_odoo_env.add_argument(
+        '--pycharm-debug',
+        choices=['stdout', 'stderr', 'none', 'both'],
+        const=True, nargs='?',
+        help="activate pycharm debug mode and send output to "
+             "server if needed, default is both", )
+
+    group_docker_run = parser.add_argument_group('docker run options')
+
+    group_docker_run.add_argument(
+        '--build',
+        help="Build docker image and then run", )
+    group_docker_run.add_argument(
+        '--docker-image',
+        help="Use this specific docker image", )
+    group_docker_run.add_argument(
+        '--dry-run', '-n',
+        action='store_true',
+        help="Don't actually start docker", )
+    group_docker_run.add_argument(
+        '--shell', choices=['bash', 'odoo'],
+        help="instead of starting odoo, start a shell")
+    group_docker_run.add_argument(
+        '--odoo-port',
+        default='8069',
+        help="specify local tcp port to expose odoo on")
+
+    args, other_args = parser.parse_known_args()
+
+    # You must initialize logging, otherwise you'll not see debug output.
+    if args.debug:
+        logging.basicConfig()
+        logging.getLogger().setLevel(logging.DEBUG)
+        requests_log = logging.getLogger("requests.packages.urllib3")
+        requests_log.setLevel(logging.DEBUG)
+        requests_log.propagate = True
+        sh_log = logging.getLogger("sh")
+        sh_log.setLevel(logging.WARN)
+        sh_log.propagate = True
+
+    db_host = dbrestore.get_db_host()
+    db_user = os.getenv('USER')
+
+    instance_data = instancedata.InstanceData()
+    workdir_path = instance_data.get_work_dir()
+
+    data_dir = os.path.join(workdir_path, 'data')
+
+    if len(instance_data.get_modules()):
+        addons_dir = os.path.join(workdir_path, 'addons-extra')
+    else:
+        addons_dir = None
+
+    argcomplete.autocomplete(parser)
+
+    print "Loading local instance data"
+    instance_data.load_from_data_file()
+
+    devel_mode = (instance_data.get_data('state') == 'devel')
+
+    if args.auto_reload and not devel_mode:
+        print "ERROR: --auto-reload is only valid on a development odoo " \
+              "instance"
+        sys.exit(255)
+
+    if args.docker_image:
+        docker_image = args.docker_image
+    else:
+        docker_image = instance_data.get_docker_image()
+
+    docker_image_tag = instance_data.get_docker_image_tag() or 'latest'
+
+    print "Checking if docker image exists"
+    if devel_mode and (
+            args.build or
+            not projectsetup.check_docker_image(docker_image,
+                                                docker_image_tag)
+    ):
+        print "Building docker image {}".format(docker_image)
+        projectsetup.build_docker_image(workdir_path, docker_image,
+                                        docker_image_tag, pull=False)
+
+    if args.database:
+        db_name = args.database
+    elif args.test_enable:
+        db_name = instance_data.get_db_name() + '_test'
+    else:
+        db_name = instance_data.get_db_name()
+
+    db_tool = dbrestore.DBTool(
+        target_db=db_name,
+        db_host=db_host,
+        data_dir=data_dir,
+        addons_dir=addons_dir,
+    )
+
+    print "Checking ODOO Database"
+    if not db_tool.check_target_db_exists():
+        if not args.test_enable:
+            print "Database '{}' not found on host {}".format(db_name, db_host)
+            sys.exit(255)
+        else:
+            db_tool.createdb_if_not_exists()
+
+    if not (db_tool.check_data_dir_exists() or args.test_enable):
+        print "Data dir for DB '{}' not found on path {}".format(db_name,
+                                                                 data_dir)
+        sys.exit(255)
+
+    docker_options = [
+        # Docker options
+        '-it',
+        '--publish={}:8069'.format(args.odoo_port),
+        '--rm',
+        '--name={}'.format(instance_data.get_name()),
+        '--volume={}:/data'.format(data_dir),
+    ]
+    if instance_data.get_data('state') == 'devel':
+        docker_options.extend([
+            '--volume={}:/opt/odoo/addons-extra'.format(addons_dir),
+            '--volume={}:/opt/odoo/repos'.format(
+                os.path.join(workdir_path, 'repos')),
+        ])
+
+    if args.pycharm_debug:
+        docker_options.extend([
+            '-e', 'PYCHARM_DEBUG_HOST={}'.format(db_host)
+        ])
+        if args.pycharm_debug == 'none':
+            docker_options.extend([
+                '-e', 'PYCHARM_DEBUG_STDOUT=False',
+                '-e', 'PYCHARM_DEBUG_STDERR=False',
+            ])
+        if args.pycharm_debug == 'stderr':
+            docker_options.extend([
+                '-e', 'PYCHARM_DEBUG_STDOUT=False',
+                '-e', 'PYCHARM_DEBUG_STDERR=True',
+            ])
+        if args.pycharm_debug == 'stdout':
+            docker_options.extend([
+                '-e', 'PYCHARM_DEBUG_STDOUT=True',
+                '-e', 'PYCHARM_DEBUG_STDERR=False',
+            ])
+        if args.pycharm_debug == 'both':
+            docker_options.extend([
+                '-e', 'PYCHARM_DEBUG_STDOUT=True',
+                '-e', 'PYCHARM_DEBUG_STDERR=True',
+            ])
+
+    odoo_addons_path = []
+    if addons_dir:
+        odoo_addons_path.append('/opt/odoo/addons-extra')
+    if instance_data.get_data('odoo_enterprise'):
+        odoo_addons_path.append('/opt/odoo/odoo-enterprise')
+    odoo_addons_path.append('/opt/odoo/odoo/addons')
+
+    if args.shell == 'bash':
+        odoo_options = [
+            '/bin/bash',
+        ]
+    elif args.shell == 'odoo':
+        odoo_options = [
+            '/opt/odoo/odoo/odoo-run.py',
+            'shell',
+            '--database={}'.format(db_name),
+        ]
+    else:
+        odoo_options = [
+            # Image options
+            '--db_host={}'.format(db_host),
+            '--db_user={}'.format(db_user),
+            '--database={}'.format(db_name),
+            '--db-filter=^{}$'.format(db_name),
+            '--data-dir=/data',
+            '--addons-path={}'.format(','.join(odoo_addons_path)),
+        ]
+
+    if other_args:
+        odoo_options.extend(other_args)
+
+    if args.test_enable:
+        odoo_options.append('--test-enable')
+        odoo_options.append('--stop-after-init')
+
+    if args.auto_reload:
+        odoo_options.append('--dev')
+
+    do_store_update_result = False
+    if args.update:
+        odoo_options.append('--update={}'.format(args.update))
+    elif devel_mode and args.auto_update:
+        module_list = instance_data.get_modules()
+        update_list = db_tool.find_modules_to_update(module_list)
+        if len(update_list):
+            do_store_update_result = True
+            odoo_options.append('--update={}'.format(','.join(update_list)))
+            odoo_options.append('--stop-after-init')
+        else:
+            print 'No update needed, starting docker in normal mode'
+
+    # Docker Command
+    # yes, argument[0] is the called executable
+    docker_cmd = (
+        ['/usr/local/bin/docker', 'run'] +
+        docker_options +
+        ['%s:%s' % (docker_image, docker_image_tag)] +
+        odoo_options
+    )
+
+    print 'Starting docker with args:'
+    print ' '.join(docker_cmd)
+
+    if args.dry_run:
+        print 'DRYRUN ACTIVATED'
+        pprint(docker_cmd)
+    else:
+        # os.execvp('/usr/local/bin/docker', docker_cmd)
+        return_code = subprocess.call(docker_cmd)
+        print 'Docker run finished with exit code {}'.format(return_code)
+        if do_store_update_result and return_code == 0:
+            print "Update Success: updating module timestamps in DB"
+            db_tool.save_actual_module_timestamps_in_db()
+
+
+if __name__ == '__main__':
+    main()

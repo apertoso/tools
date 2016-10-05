@@ -1,0 +1,12 @@
+argcomplete
+caffeine
+clint
+lxml
+netifaces
+ovh
+psycopg2
+requests
+requests_toolbelt
+sh
+subprocess32
+tzlocal

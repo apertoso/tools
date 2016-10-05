@@ -1,0 +1,149 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# PYTHON_ARGCOMPLETE_OK
+
+import argparse
+import logging
+import os
+import warnings
+
+import argcomplete
+import glob
+
+if __name__ == '__main__' and __package__ is None:
+    from os import sys, path
+
+    sys.path.append(
+        path.dirname(
+            path.dirname(
+                path.abspath(__file__)
+            )
+        )
+    )
+    from packages import instancedata, dbrestore
+
+
+def arg_zip_completer(prefix, **kwargs):
+    return glob.glob('{}*.zip'.format(prefix or ''))
+
+
+def main():
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            import caffeine
+            caffeine.on(display=False)
+    except (ImportError, OSError):
+        pass
+
+    parser = argparse.ArgumentParser(
+        parents=instancedata.get_parser()
+    )
+    parser.add_argument('--database', '-d',
+                        help="Specify the database name to use", )
+    parser.add_argument('--drop',
+                        action='store_true',
+                        help="Drop existing DB first", )
+    parser.add_argument('--zip',
+                        help="Restore from this zip file",
+                        ).completer = arg_zip_completer
+    parser.add_argument('--post',
+                        action='store_true',
+                        help="Only do the post process step")
+    parser.add_argument('--dbuser',
+                        help="Database user")
+    parser.add_argument('--dbpassword',
+                        help="Database password")
+    parser.add_argument('--dbhost',
+                        help="Database host")
+    parser.add_argument('--nologinreset',
+                        action='store_true',
+                        help="Do not reset login credentials")
+    parser.add_argument('--docker',
+                        action='store_true',
+                        help="Use docker magic")
+    parser.add_argument('--pgversion',
+                        default='9.3',
+                        help="Override default postgres version (9.3)")
+
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+
+    if not any([args.zip, args.post, args.drop]):
+        print "Nothing to do, choose --zip, --post or --drop"
+        print ""
+        parser.print_help()
+
+    # You must initialize logging, otherwise you'll not see debug output.
+    if args.debug:
+        logging.basicConfig()
+        logging.getLogger().setLevel(logging.DEBUG)
+        requests_log = logging.getLogger("requests.packages.urllib3")
+        requests_log.setLevel(logging.DEBUG)
+        requests_log.propagate = True
+        sh_log = logging.getLogger("sh")
+        sh_log.setLevel(logging.WARN)
+        sh_log.propagate = True
+
+    if args.dbhost:
+        db_host = args.dbhost
+    else:
+        db_host = dbrestore.get_db_host()
+
+    instance_data = instancedata.InstanceData(workdir=args.work_dir)
+    workdir_path = instance_data.get_work_dir()
+    instance_data.load_from_data_file()
+
+    if args.database:
+        db_name = args.database
+    else:
+        db_name = instance_data.get_db_name()
+
+    db_tool = dbrestore.DBTool(
+        target_db=db_name,
+        db_host=db_host,
+        db_user=args.dbuser,
+        db_password=args.dbpassword,
+        data_dir=os.path.join(workdir_path, 'data'),
+        pgversion=args.pgversion,
+        addons_dir=os.path.join(workdir_path, 'addons-extra')
+    )
+
+    if args.drop:
+        print "Dropping database {}".format(db_name)
+        db_tool.do_drop_db_if_exists()
+
+    if args.zip:
+        if not db_tool.check_target_db_exists():
+            print "Creating database {}".format(db_name)
+            db_tool.createdb_if_not_exists()
+        if not db_tool.check_valid_odoo_db():
+            print "Restoring database {} from zip file".format(db_name,
+                                                               args.zip)
+            if args.docker:
+                db_tool.restore_db_docker(args.zip)
+            else:
+                db_tool.restore_db(args.zip)
+        print "Restoring attachments for " \
+              "database {} from zip file {}".format(db_name, args.zip)
+        db_tool.restore_attachments(args.zip, args.docker)
+    else:
+        db_tool.check_target_db_exists()
+
+    if args.zip or args.post:
+        # db_tool.save_actual_module_timestamps_in_db()
+        if not args.nologinreset:
+            print "Resetting login passwords to 'admin'"
+            db_tool.set_test_logins()
+        print "Disabling ir_crons"
+        db_tool.set_ir_crons_disabled()
+        print "Resetting db uuid"
+        db_tool.set_db_uuid()
+        print "Resetting Aeroo config to localhost"
+        db_tool.set_aeroo_localhost()
+        print "Resetting mail config to debugmail.io"
+        db_tool.set_mail_debugmail()
+
+
+if __name__ == '__main__':
+    main()

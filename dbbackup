@@ -1,0 +1,103 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# PYTHON_ARGCOMPLETE_OK
+
+import datetime
+
+import argcomplete
+import argparse
+import warnings
+from tzlocal import get_localzone
+
+if __name__ == '__main__' and __package__ is None:
+    from os import sys, path
+
+    sys.path.append(
+        path.dirname(
+            path.dirname(
+                path.abspath(__file__)
+            )
+        )
+    )
+    from packages import instancedata
+    from packages.dbbackup import do_download_db, do_test_archive
+
+
+def main():
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            import caffeine
+            caffeine.on(display=False)
+    except (ImportError, OSError):
+        pass
+
+    parser = argparse.ArgumentParser(
+        parents=instancedata.get_parser()
+    )
+
+    parser.add_argument(
+        '-p', '--password',
+        help="odoo master password")
+    parser.add_argument(
+        '--api',
+        choices=('8.0', '9.0', 'ssh'),
+        help="odoo backup api to use (8.0 or 9.0). "
+             "Use 'ssh' to sidestep the odoo api")
+    parser.add_argument(
+        '--download-url',
+        help="Custom odoo instance url to fetch backup from")
+    parser.add_argument(
+        '-d', '--database',
+        help="Database name to backup")
+    parser.add_argument(
+        '--skip-test',
+        action='store_true',
+        help="Skip database archive test after download")
+    parser.add_argument(
+        '--hostname',
+        help="Specify custom hostname to fetch backup from with ssh")
+    parser.add_argument(
+        '--filename',
+        help="Manualy specify a filename for the resulting zipfile")
+
+    argcomplete.autocomplete(parser)
+    args = parser.parse_args()
+
+    instance_data = instancedata.InstanceData(url=args.url,
+                                              workdir=args.work_dir)
+
+    database = args.database or instance_data.get_db_name()
+    download_url = args.download_url or instance_data.get_data(
+        'instance_url')
+    master_pwd = args.password or instance_data.get_data('odoo_master_pwd')
+    api = args.api or instance_data.get_data('odoo_version')
+
+    if not args.filename:
+        ts = datetime.datetime.now(get_localzone()).strftime(
+            '%Y%m%d-%H%M%S-%Z')
+        filename = "{}_{}.{}".format(database, ts, 'zip')
+    else:
+        filename = args.filename
+
+    print 'Downloading database {} from {} with {} api'.format(database,
+                                                               download_url,
+                                                               api)
+    do_download_db(
+        database_name=database,
+        base_url=download_url,
+        master_pwd=master_pwd,
+        filename=filename,
+        api=api,
+        hostname=args.hostname
+    )
+
+    if not args.skip_test:
+        print "Testing archive {}".format(filename)
+        do_test_archive(filename)
+    else:
+        print "Testing archive {} skipped".format(filename)
+
+
+if __name__ == '__main__':
+    main()

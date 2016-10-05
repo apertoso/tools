@@ -5,6 +5,7 @@ located in*** `~/Workspace/tools`
 
 ## Contents: ##
 * flake_run.sh: run flake tests
+* Docker tooling scripts, see below
 
 ## Requirements: ##
 * postgres.app, see http://postgresapp.com/
